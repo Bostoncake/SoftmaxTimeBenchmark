@@ -86,9 +86,11 @@ def parse_args():
     )
 
     parser.add_argument(
-        '--flash-attention',
-        action='store_true',
-        help='Use Flash Attention 2 if available'
+        '--attn-implementation',
+        type=str,
+        default='eager',
+        choices=['eager', 'sdpa', 'flash_attention_2'],
+        help='Attention implementation (default: eager for accurate profiling)'
     )
 
     return parser.parse_args()
@@ -168,6 +170,7 @@ def main():
     logger.info(f"Number of runs: {args.num_runs}")
     logger.info(f"Device: {args.device}")
     logger.info(f"Dtype: {args.dtype}")
+    logger.info(f"Attention implementation: {args.attn_implementation}")
     logger.info(f"Output directory: {args.output_dir}")
     logger.info("="*100)
 
@@ -184,11 +187,16 @@ def main():
                 model_key,
                 device=args.device,
                 torch_dtype=dtype,
-                use_flash_attention=args.flash_attention
+                attn_implementation=args.attn_implementation
             )
 
             # Create benchmark
-            benchmark = LLMBenchmark(model, tokenizer, device=args.device)
+            benchmark = LLMBenchmark(
+                model,
+                tokenizer,
+                device=args.device,
+                attn_implementation=args.attn_implementation
+            )
 
             # Run benchmark
             results = benchmark.run_benchmark(
@@ -202,6 +210,7 @@ def main():
             results['model_name'] = ModelLoader.get_model_info(model_key)['name']
             results['device'] = args.device
             results['dtype'] = args.dtype
+            results['attn_implementation'] = args.attn_implementation
             results['timestamp'] = datetime.now().isoformat()
 
             # Save results
@@ -229,7 +238,8 @@ def main():
                 'num_tokens': args.num_tokens,
                 'num_runs': args.num_runs,
                 'device': args.device,
-                'dtype': args.dtype
+                'dtype': args.dtype,
+                'attn_implementation': args.attn_implementation
             },
             'results': all_results
         }

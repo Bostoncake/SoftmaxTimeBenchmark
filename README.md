@@ -2,6 +2,8 @@
 
 A comprehensive benchmarking suite for measuring the time consumed by Softmax operations versus all other operations during LLM inference. This tool helps analyze the computational breakdown of different language models during token generation.
 
+> **⚠️ IMPORTANT**: This benchmark uses **eager attention** by default to ensure accurate softmax measurements. Modern transformers use fused attention (SDPA, Flash Attention) which makes softmax impossible or difficult to measure separately. See [ATTENTION_IMPLEMENTATIONS.md](ATTENTION_IMPLEMENTATIONS.md) for details.
+
 ## Features
 
 - **Precise Time Profiling**: Separates Softmax operation time from other operations using PyTorch hooks
@@ -103,7 +105,7 @@ python run_benchmark.py \
 | `--device` | Device to use (cuda, cpu) | cuda |
 | `--dtype` | Model dtype (float16, float32, bfloat16) | float16 |
 | `--output-dir` | Output directory for results | results |
-| `--flash-attention` | Use Flash Attention 2 if available | False |
+| `--attn-implementation` | Attention implementation (eager, sdpa, flash_attention_2) | eager |
 
 ## Example Commands
 
@@ -139,6 +141,44 @@ python run_benchmark.py \
 python run_benchmark.py --models llama2-7b mistral-7b
 ```
 
+## Attention Implementation
+
+**IMPORTANT:** Modern transformers use different attention implementations that affect profiling accuracy.
+
+### Eager Attention (Default, Recommended)
+
+```bash
+python run_benchmark.py --attn-implementation eager
+```
+
+- ✅ **Exact softmax measurements** - softmax is called as a separate operation
+- ✅ Accurate profiling of softmax time
+- ❌ Slower than fused implementations
+
+**Use this for benchmarking** (it's the default).
+
+### SDPA (Fused Attention)
+
+```bash
+python run_benchmark.py --attn-implementation sdpa
+```
+
+- ⚠️ **Estimated softmax measurements** - softmax is fused into scaled_dot_product_attention
+- ✅ Faster than eager
+- ⚠️ Softmax time is estimated as ~10% of SDPA time
+
+### Flash Attention 2
+
+```bash
+python run_benchmark.py --attn-implementation flash_attention_2
+```
+
+- ❌ **Cannot measure softmax separately** - fully fused kernel
+- ✅ Fastest implementation
+- ❌ Not suitable for softmax-specific benchmarking
+
+**For detailed explanation, see [ATTENTION_IMPLEMENTATIONS.md](ATTENTION_IMPLEMENTATIONS.md)**
+
 ## Understanding Results
 
 ### Output Files
@@ -157,6 +197,8 @@ Results are saved in the `results/` directory:
   "softmax_percentage": 4.75,    // Percentage of time in Softmax
   "tokens_per_second": 22.63,    // Generation speed
   "softmax_count": 12288,        // Number of Softmax calls
+  "sdpa_count": 0,               // Number of SDPA calls (0 for eager)
+  "attention_implementation": "eager (softmax time exact)",
   "model_name": "LLaMA-2 7B",
   "context_length": 8192,
   "num_tokens": 1024
@@ -216,16 +258,27 @@ The default benchmark:
 
 ### What is Measured
 
-- **Softmax Time**: Time spent in `torch.nn.functional.softmax()` operations, including:
-  - Attention softmax in self-attention layers
-  - Final softmax over vocabulary for token sampling
+**With Eager Attention (Recommended):**
 
-- **Other Operations**: All other operations, including:
-  - Matrix multiplications
+- **Softmax Time**: Exact time spent in `torch.nn.functional.softmax()` operations:
+  - Attention softmax in self-attention layers (one per layer)
+  - Final softmax over vocabulary for token sampling
+  - **Measurement method**: Direct function patching - EXACT
+
+- **Other Operations**: All other operations:
+  - Matrix multiplications (QKV projections, attention, MLPs)
   - Layer normalization
   - Activation functions (GELU, SiLU)
   - Embedding lookups
   - All other transformer operations
+
+**With SDPA:**
+- **Softmax Time**: Estimated as ~10% of SDPA time
+  - **Measurement method**: Estimation - APPROXIMATE
+
+**With Flash Attention 2:**
+- **Softmax Time**: Cannot be measured separately
+  - **Measurement method**: Not available - USE EAGER INSTEAD
 
 ### Performance Tips
 

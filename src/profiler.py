@@ -1,166 +1,65 @@
 """
 Profiler module for measuring time spent in Softmax and other operations.
-Uses PyTorch hooks to intercept and time operations during forward pass.
+Handles different attention implementations (eager, SDPA, Flash Attention).
 """
 
 import time
 import torch
 import torch.nn.functional as F
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, Optional
 from contextlib import contextmanager
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-class OperationProfiler:
+class AttentionProfiler:
     """
-    Profiler that hooks into PyTorch operations to measure execution time.
-    Specifically tracks Softmax operations separately from other operations.
-    """
+    Advanced profiler that handles different attention implementations in transformers.
 
-    def __init__(self):
-        self.softmax_time = 0.0
-        self.total_time = 0.0
-        self.operation_counts = defaultdict(int)
-        self.operation_times = defaultdict(float)
-        self.hooks = []
-        self.enabled = False
+    Transformers can use different attention mechanisms:
+    - eager: Uses explicit F.softmax calls (easiest to profile)
+    - sdpa: Uses fused torch.nn.functional.scaled_dot_product_attention
+    - flash_attention_2: Uses Flash Attention 2 (fully fused kernel)
 
-    def reset(self):
-        """Reset all timing statistics."""
-        self.softmax_time = 0.0
-        self.total_time = 0.0
-        self.operation_counts.clear()
-        self.operation_times.clear()
-
-    def _create_forward_hook(self, module_name: str):
-        """Create a forward hook for a module to measure execution time."""
-        def hook(module, input, output):
-            if not self.enabled:
-                return
-
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            start_time = time.perf_counter()
-
-            # Let the output be computed (already done, but we measure the time)
-            # We actually need to measure during execution, so we'll use a different approach
-
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            elapsed = time.perf_counter() - start_time
-
-            self.operation_counts[module_name] += 1
-            self.operation_times[module_name] += elapsed
-
-        return hook
-
-    def _create_pre_forward_hook(self, module_name: str):
-        """Create a pre-forward hook to mark the start of execution."""
-        def hook(module, input):
-            if not self.enabled:
-                return
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            module._profiler_start_time = time.perf_counter()
-        return hook
-
-    def _create_post_forward_hook(self, module_name: str, is_softmax: bool = False):
-        """Create a post-forward hook to measure execution time."""
-        def hook(module, input, output):
-            if not self.enabled:
-                return
-
-            torch.cuda.synchronize() if torch.cuda.is_available() else None
-            elapsed = time.perf_counter() - module._profiler_start_time
-
-            self.operation_counts[module_name] += 1
-            self.operation_times[module_name] += elapsed
-
-            if is_softmax:
-                self.softmax_time += elapsed
-            self.total_time += elapsed
-
-        return hook
-
-    def register_hooks(self, model: torch.nn.Module):
-        """
-        Register hooks on all modules in the model.
-        Identifies Softmax operations and tracks them separately.
-        """
-        self.remove_hooks()
-
-        for name, module in model.named_modules():
-            # Check if this is a Softmax operation
-            is_softmax = isinstance(module, torch.nn.Softmax)
-
-            # Register pre and post hooks
-            pre_hook = module.register_forward_pre_hook(
-                self._create_pre_forward_hook(name)
-            )
-            post_hook = module.register_forward_hook(
-                self._create_post_forward_hook(name, is_softmax)
-            )
-
-            self.hooks.append(pre_hook)
-            self.hooks.append(post_hook)
-
-    def remove_hooks(self):
-        """Remove all registered hooks."""
-        for hook in self.hooks:
-            hook.remove()
-        self.hooks.clear()
-
-    @contextmanager
-    def profile(self):
-        """Context manager to enable profiling."""
-        self.reset()
-        self.enabled = True
-        try:
-            yield self
-        finally:
-            self.enabled = False
-
-    def get_summary(self) -> Dict[str, float]:
-        """
-        Get a summary of profiling results.
-
-        Returns:
-            Dictionary with timing statistics:
-            - softmax_time: Total time spent in Softmax operations
-            - other_time: Total time spent in non-Softmax operations
-            - total_time: Total time for all operations
-            - softmax_percentage: Percentage of time spent in Softmax
-        """
-        other_time = self.total_time - self.softmax_time
-        softmax_percentage = (self.softmax_time / self.total_time * 100) if self.total_time > 0 else 0
-
-        return {
-            'softmax_time': self.softmax_time,
-            'other_time': other_time,
-            'total_time': self.total_time,
-            'softmax_percentage': softmax_percentage,
-            'operation_counts': dict(self.operation_counts),
-            'operation_times': dict(self.operation_times)
-        }
-
-
-class FunctionalSoftmaxProfiler:
-    """
-    Alternative profiler that monkey-patches F.softmax to measure functional softmax calls.
-    This catches softmax operations that aren't nn.Softmax modules.
+    This profiler patches the relevant functions to measure softmax time.
     """
 
-    def __init__(self):
+    def __init__(self, attention_type: str = 'auto'):
+        """
+        Initialize profiler.
+
+        Args:
+            attention_type: 'auto', 'eager', 'sdpa', or 'flash_attention_2'
+        """
+        self.attention_type = attention_type
         self.softmax_time = 0.0
         self.softmax_count = 0
+        self.sdpa_time = 0.0
+        self.sdpa_count = 0
         self.total_time = 0.0
         self.enabled = False
+
+        # Store original functions
         self._original_softmax = None
+        self._original_sdpa = None
         self._start_time = None
+
+        # Detailed operation tracking
+        self.operation_times = defaultdict(float)
+        self.operation_counts = defaultdict(int)
 
     def reset(self):
         """Reset all timing statistics."""
         self.softmax_time = 0.0
         self.softmax_count = 0
+        self.sdpa_time = 0.0
+        self.sdpa_count = 0
         self.total_time = 0.0
         self._start_time = None
+        self.operation_times.clear()
+        self.operation_counts.clear()
 
     def _patched_softmax(self, *args, **kwargs):
         """Patched version of F.softmax that measures execution time."""
@@ -177,26 +76,76 @@ class FunctionalSoftmaxProfiler:
 
         self.softmax_time += elapsed
         self.softmax_count += 1
+        self.operation_times['softmax'] += elapsed
+        self.operation_counts['softmax'] += 1
 
         return result
 
-    def patch_softmax(self):
-        """Monkey-patch F.softmax to intercept calls."""
+    def _patched_sdpa(self, *args, **kwargs):
+        """
+        Patched version of scaled_dot_product_attention.
+
+        SDPA fuses the entire attention computation including softmax.
+        We measure the total SDPA time and estimate softmax contribution.
+        """
+        if not self.enabled:
+            return self._original_sdpa(*args, **kwargs)
+
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        start = time.perf_counter()
+
+        result = self._original_sdpa(*args, **kwargs)
+
+        torch.cuda.synchronize() if torch.cuda.is_available() else None
+        elapsed = time.perf_counter() - start
+
+        self.sdpa_time += elapsed
+        self.sdpa_count += 1
+        self.operation_times['sdpa'] += elapsed
+        self.operation_counts['sdpa'] += 1
+
+        # Estimate softmax time as a portion of SDPA time
+        # Based on typical attention breakdown: QK^T (40%), softmax (10%), softmax*V (50%)
+        estimated_softmax = elapsed * 0.1
+        self.softmax_time += estimated_softmax
+        self.softmax_count += 1
+
+        return result
+
+    def patch_functions(self):
+        """Monkey-patch attention-related functions."""
+        # Always patch F.softmax
         if self._original_softmax is None:
             self._original_softmax = F.softmax
             F.softmax = self._patched_softmax
+            logger.info("Patched F.softmax")
 
-    def unpatch_softmax(self):
-        """Restore original F.softmax."""
+        # Patch scaled_dot_product_attention if available
+        if hasattr(F, 'scaled_dot_product_attention'):
+            if self._original_sdpa is None:
+                self._original_sdpa = F.scaled_dot_product_attention
+                F.scaled_dot_product_attention = self._patched_sdpa
+                logger.info("Patched F.scaled_dot_product_attention")
+        else:
+            logger.warning("F.scaled_dot_product_attention not available (PyTorch < 2.0)")
+
+    def unpatch_functions(self):
+        """Restore original functions."""
         if self._original_softmax is not None:
             F.softmax = self._original_softmax
             self._original_softmax = None
+            logger.debug("Unpatched F.softmax")
+
+        if self._original_sdpa is not None:
+            F.scaled_dot_product_attention = self._original_sdpa
+            self._original_sdpa = None
+            logger.debug("Unpatched F.scaled_dot_product_attention")
 
     @contextmanager
     def profile(self):
         """Context manager to enable profiling."""
         self.reset()
-        self.patch_softmax()
+        self.patch_functions()
         self.enabled = True
         self._start_time = time.perf_counter()
 
@@ -207,19 +156,55 @@ class FunctionalSoftmaxProfiler:
             self.total_time = time.perf_counter() - self._start_time
             self.enabled = False
 
-    def get_summary(self) -> Dict[str, float]:
-        """Get a summary of profiling results."""
+            # Log detection results
+            if self.softmax_count == 0 and self.sdpa_count == 0:
+                logger.warning(
+                    "No softmax or SDPA operations detected! "
+                    "The model may be using Flash Attention or another fused implementation. "
+                    "Consider using --attn-implementation eager for accurate softmax profiling."
+                )
+            elif self.sdpa_count > 0:
+                logger.info(
+                    f"Detected SDPA usage ({self.sdpa_count} calls). "
+                    f"Softmax time is estimated at ~10% of SDPA time. "
+                    f"Use --attn-implementation eager for exact measurements."
+                )
+
+    def get_summary(self) -> Dict[str, any]:
+        """
+        Get a summary of profiling results.
+
+        Returns:
+            Dictionary with timing statistics
+        """
         other_time = self.total_time - self.softmax_time
         softmax_percentage = (self.softmax_time / self.total_time * 100) if self.total_time > 0 else 0
+
+        # Determine which attention implementation was used
+        if self.sdpa_count > 0 and self.softmax_count <= self.sdpa_count:
+            attention_impl = 'sdpa (softmax time estimated)'
+        elif self.softmax_count > 0:
+            attention_impl = 'eager (softmax time exact)'
+        else:
+            attention_impl = 'unknown (possibly flash_attention_2)'
 
         return {
             'softmax_time': self.softmax_time,
             'other_time': other_time,
             'total_time': self.total_time,
             'softmax_percentage': softmax_percentage,
-            'softmax_count': self.softmax_count
+            'softmax_count': self.softmax_count,
+            'sdpa_count': self.sdpa_count,
+            'sdpa_time': self.sdpa_time,
+            'attention_implementation': attention_impl,
+            'operation_times': dict(self.operation_times),
+            'operation_counts': dict(self.operation_counts)
         }
 
     def __del__(self):
-        """Ensure softmax is unpatched when profiler is destroyed."""
-        self.unpatch_softmax()
+        """Ensure functions are unpatched when profiler is destroyed."""
+        self.unpatch_functions()
+
+
+# Backwards compatibility alias
+FunctionalSoftmaxProfiler = AttentionProfiler

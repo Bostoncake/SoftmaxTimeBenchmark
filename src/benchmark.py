@@ -9,7 +9,7 @@ import logging
 from typing import Dict, Optional
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-from .profiler import FunctionalSoftmaxProfiler
+from .profiler import AttentionProfiler
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -25,7 +25,8 @@ class LLMBenchmark:
         self,
         model: AutoModelForCausalLM,
         tokenizer: AutoTokenizer,
-        device: str = 'cuda'
+        device: str = 'cuda',
+        attn_implementation: str = 'eager'
     ):
         """
         Initialize the benchmark.
@@ -34,11 +35,13 @@ class LLMBenchmark:
             model: The language model to benchmark
             tokenizer: The tokenizer for the model
             device: Device to run on ('cuda' or 'cpu')
+            attn_implementation: Attention implementation used by model
         """
         self.model = model
         self.tokenizer = tokenizer
         self.device = device
-        self.profiler = FunctionalSoftmaxProfiler()
+        self.attn_implementation = attn_implementation
+        self.profiler = AttentionProfiler(attention_type=attn_implementation)
 
     def prepare_context(self, context_length: int = 8192) -> torch.Tensor:
         """

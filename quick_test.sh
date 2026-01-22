@@ -13,6 +13,7 @@ python run_benchmark.py \
     --context-length 512 \
     --num-tokens 128 \
     --num-runs 1 \
+    --attn-implementation eager \
     --output-dir test_results
 
 echo ""

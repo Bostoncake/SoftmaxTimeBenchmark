@@ -41,7 +41,7 @@ class ModelLoader:
         model_key: str,
         device: str = 'cuda',
         torch_dtype: torch.dtype = torch.float16,
-        use_flash_attention: bool = False
+        attn_implementation: str = 'eager'
     ) -> Tuple[AutoModelForCausalLM, AutoTokenizer]:
         """
         Load a model and tokenizer.
@@ -50,7 +50,10 @@ class ModelLoader:
             model_key: Key from MODEL_CONFIGS (e.g., 'llama2-7b')
             device: Device to load model on ('cuda' or 'cpu')
             torch_dtype: Data type for model weights
-            use_flash_attention: Whether to use Flash Attention 2 if available
+            attn_implementation: Attention implementation to use:
+                - 'eager': Standard attention with explicit softmax (best for profiling)
+                - 'sdpa': PyTorch scaled_dot_product_attention (fused, faster)
+                - 'flash_attention_2': Flash Attention 2 (fastest, hardest to profile)
 
         Returns:
             Tuple of (model, tokenizer)
@@ -86,6 +89,8 @@ class ModelLoader:
 
         # Load model
         logger.info(f"Loading model on {device} with dtype {torch_dtype}...")
+        logger.info(f"Using attention implementation: {attn_implementation}")
+
         model_kwargs = {
             'pretrained_model_name_or_path': model_id,
             'torch_dtype': torch_dtype,
@@ -94,13 +99,25 @@ class ModelLoader:
             'low_cpu_mem_usage': True
         }
 
-        # Add Flash Attention if requested
-        if use_flash_attention:
-            try:
-                model_kwargs['attn_implementation'] = 'flash_attention_2'
-                logger.info("Using Flash Attention 2")
-            except Exception as e:
-                logger.warning(f"Flash Attention 2 not available: {e}")
+        # Set attention implementation
+        # eager = standard attention with explicit softmax (best for accurate profiling)
+        # sdpa = scaled_dot_product_attention (fused, faster)
+        # flash_attention_2 = Flash Attention 2 (fastest but hardest to profile)
+        if attn_implementation != 'auto':
+            model_kwargs['attn_implementation'] = attn_implementation
+            logger.info(f"Forcing attention implementation: {attn_implementation}")
+
+            if attn_implementation == 'eager':
+                logger.info(
+                    "Using 'eager' attention for accurate softmax profiling. "
+                    "This will be slower but provides exact softmax measurements."
+                )
+            elif attn_implementation in ['sdpa', 'flash_attention_2']:
+                logger.warning(
+                    f"Using '{attn_implementation}' attention. Softmax time will be "
+                    f"estimated as part of fused attention operations. "
+                    f"Use 'eager' for exact measurements."
+                )
 
         model = AutoModelForCausalLM.from_pretrained(**model_kwargs)
 
